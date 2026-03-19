@@ -1105,7 +1105,7 @@ class CharacterSprite {
   private tMs = 0
   private walkTMs = 0
   private walkTarget: { x: number; y: number; onArrive: () => void } | null = null
-  private readonly walkSpeed = 115  // px/second
+  private readonly walkSpeed = 68  // px/second (was 115 — slower = more natural)
 
   // Current base Y when NOT walking (used for bob)
   private baseX: number
@@ -1175,6 +1175,10 @@ class CharacterSprite {
 
   setState(s: CharState) {
     if (this.state === s) return
+    // Clear any in-progress walk when switching to a non-walk state.
+    // Without this, an interrupted walkAlongPath leaves walkTarget non-null,
+    // which permanently breaks isAvailableForIdle.
+    if (s !== 'walk') this.walkTarget = null
     this.state = s
     this.zzz.hide()
     this.bubble.visible = false
@@ -1365,7 +1369,10 @@ export class WarRoomCanvas {
   private idleActivityAgents = new Set<string>()
   // Timer for next idle-activity check
   private idleCheckMs = 0
-  private readonly IDLE_INTERVAL_MS = 7000
+  private readonly IDLE_INTERVAL_MS = 12000
+  // WC occupied state + dark overlay
+  private wcOccupied = false
+  private wcOverlay!: PIXI.Graphics
 
   async init(parent: HTMLElement) {
     this.app = new PIXI.Application({
@@ -1441,6 +1448,17 @@ export class WarRoomCanvas {
     })
 
     drawRoomTitle(this.app.stage)
+
+    // ── WC darkness overlay (visible when someone is inside) ───────────────
+    this.wcOverlay = new PIXI.Graphics()
+    this.wcOverlay.beginFill(0x000000, 0.62)
+    this.wcOverlay.drawRect(
+      ZONE.solidPartX + 15, ZONE.solidPartY1,
+      CANVAS_W - ZONE.solidPartX - 15, ZONE.solidPartY2 - ZONE.solidPartY1
+    )
+    this.wcOverlay.endFill()
+    this.wcOverlay.visible = false
+    this.app.stage.addChild(this.wcOverlay)
 
     // ── Character layer (on top of everything) ────────────────────────────
     this.charLayer = new PIXI.Container()
@@ -1533,8 +1551,8 @@ export class WarRoomCanvas {
     if (this.officeMode !== 'active') return
     this.idleCheckMs += dMs
     if (this.idleCheckMs < this.IDLE_INTERVAL_MS) return
-    // Reset with slight randomness so bursts don't sync up
-    this.idleCheckMs = -(Math.random() * 2000)
+    // Reset with jitter so bursts don't sync up
+    this.idleCheckMs = -(Math.random() * 3000)
 
     // Collect agents that are free to roam
     const free = Array.from(this.chars.entries()).filter(
@@ -1549,22 +1567,47 @@ export class WarRoomCanvas {
     // Shuffle
     free.sort(() => Math.random() - 0.5)
 
-    // 15% chance: one agent goes to the WC
-    if (Math.random() < 0.15) {
+    const roll = Math.random()
+
+    // 10% chance: WC visit (only if not already occupied)
+    if (roll < 0.10 && !this.wcOccupied) {
       const [id, sprite] = free[0]
       this._startWCVisit(id, sprite)
       return
     }
 
-    // 50% chance: pick a pair for a casual chat (if 2+ available)
-    if (free.length >= 2 && Math.random() < 0.50) {
+    // 14% chance: coffee run to utility zone
+    if (roll < 0.24) {
+      const [id, sprite] = free[0]
+      this._startCoffeeRun(id, sprite)
+      return
+    }
+
+    // 14% chance: bookshelf browse
+    if (roll < 0.38) {
+      const [id, sprite] = free[0]
+      const spot = BOOKSHELF_SPOTS[Math.floor(Math.random() * BOOKSHELF_SPOTS.length)]
+      this._startBookshelfBrowse(id, sprite, spot)
+      return
+    }
+
+    // 10% chance: water / look at a plant
+    if (roll < 0.48) {
+      const [id, sprite] = free[0]
+      const spot = PLANT_SPOTS[Math.floor(Math.random() * PLANT_SPOTS.length)]
+      this._startPlantVisit(id, sprite, spot)
+      return
+    }
+
+    // 30% chance: casual chat (needs 2+ free agents)
+    if (free.length >= 2 && roll < 0.78) {
       const [[id1, s1], [id2, s2]] = free
       const pair = CHAT_SPOT_PAIRS[Math.floor(Math.random() * CHAT_SPOT_PAIRS.length)]
       this._startIdleChat(id1, s1, pair[0], id2, s2, pair[1])
       return
     }
 
-    // Otherwise: 1-2 agents wander independently
+    // Otherwise: 1-2 agents wander to a generic spot
     const count = Math.min(free.length, Math.random() < 0.35 ? 2 : 1)
     for (let i = 0; i < count; i++) {
       const [id, sprite] = free[i]
@@ -1625,13 +1668,65 @@ export class WarRoomCanvas {
     this.idleActivityAgents.add(id)
     const path = planPath(sprite.container.x, sprite.container.y, DOORS.wcSpot.x, DOORS.wcSpot.y)
     sprite.walkAlongPath(path, () => {
-      // Spend 8–15 s in the WC
+      // Turn off the lights — agent is inside
+      this.wcOccupied = true
+      this.wcOverlay.visible = true
       const duration = 8000 + Math.random() * 7000
       setTimeout(() => {
+        // Always restore lights, even if activity was cancelled externally
+        this.wcOccupied = false
+        this.wcOverlay.visible = false
         if (!this.idleActivityAgents.has(id)) return
         sprite.goHome(this.officeMode === 'sleep' ? 'zzz' : 'idle')
         setTimeout(() => this.idleActivityAgents.delete(id), 8000)
       }, duration)
+    })
+  }
+
+  private _startBookshelfBrowse(
+    id: string,
+    sprite: CharacterSprite,
+    spot: { x: number; y: number }
+  ) {
+    this.idleActivityAgents.add(id)
+    const path = planPath(sprite.container.x, sprite.container.y, spot.x, spot.y)
+    sprite.walkAlongPath(path, () => {
+      const linger = 9000 + Math.random() * 11000  // 9–20s browsing
+      setTimeout(() => {
+        if (!this.idleActivityAgents.has(id)) return
+        sprite.goHome(this.officeMode === 'sleep' ? 'zzz' : 'idle')
+        setTimeout(() => this.idleActivityAgents.delete(id), 8000)
+      }, linger)
+    })
+  }
+
+  private _startPlantVisit(
+    id: string,
+    sprite: CharacterSprite,
+    spot: { x: number; y: number }
+  ) {
+    this.idleActivityAgents.add(id)
+    const path = planPath(sprite.container.x, sprite.container.y, spot.x, spot.y)
+    sprite.walkAlongPath(path, () => {
+      const linger = 4000 + Math.random() * 5000  // 4–9s watering / admiring
+      setTimeout(() => {
+        if (!this.idleActivityAgents.has(id)) return
+        sprite.goHome(this.officeMode === 'sleep' ? 'zzz' : 'idle')
+        setTimeout(() => this.idleActivityAgents.delete(id), 8000)
+      }, linger)
+    })
+  }
+
+  private _startCoffeeRun(id: string, sprite: CharacterSprite) {
+    this.idleActivityAgents.add(id)
+    const path = planPath(sprite.container.x, sprite.container.y, COFFEE_SPOT.x, COFFEE_SPOT.y)
+    sprite.walkAlongPath(path, () => {
+      const linger = 10000 + Math.random() * 10000  // 10–20s getting coffee
+      setTimeout(() => {
+        if (!this.idleActivityAgents.has(id)) return
+        sprite.goHome(this.officeMode === 'sleep' ? 'zzz' : 'idle')
+        setTimeout(() => this.idleActivityAgents.delete(id), 8000)
+      }, linger)
     })
   }
 

@@ -63,14 +63,29 @@ export const DOORS = {
   wcSpot:      { x: 752, y: 406 },  // Inside WC (toilet/sink area)
 }
 
-// Zone adjacency graph
-const ZONE_GRAPH: Record<string, Array<{ door: {x:number;y:number}; next: string }>> = {
-  lab:      [{ door: DOORS.labSouth,    next: 'corridor' }, { door: DOORS.glassDoor,   next: 'strategy' }],
-  strategy: [{ door: DOORS.stratSouth,  next: 'corridor' }, { door: DOORS.glassDoor,   next: 'lab'      }],
-  corridor: [{ door: DOORS.labSouth,    next: 'lab'      }, { door: DOORS.stratSouth,  next: 'strategy' },
-             { door: DOORS.studioNorth, next: 'studio'   }],
-  studio:   [{ door: DOORS.studioNorth, next: 'corridor' }, { door: DOORS.solidDoor,   next: 'utility'  }],
-  utility:  [{ door: DOORS.solidDoor,   next: 'studio'   }],
+// Axis to align BEFORE crossing each door (prevents diagonal door-crossing)
+// 'x' = horizontal partition: align X-coord with door first, then walk straight through
+// 'y' = vertical partition: align Y-coord with door first, then walk straight through
+const DOOR_CROSS_AXIS: Record<string, 'x' | 'y'> = {
+  labSouth:    'x',
+  stratSouth:  'x',
+  studioNorth: 'x',
+  glassDoor:   'y',
+  solidDoor:   'y',
+}
+
+// Zone adjacency graph (each edge now carries a name for axis-alignment lookup)
+const ZONE_GRAPH: Record<string, Array<{ name: string; door: {x:number;y:number}; next: string }>> = {
+  lab:      [{ name: 'labSouth',    door: DOORS.labSouth,    next: 'corridor' },
+             { name: 'glassDoor',   door: DOORS.glassDoor,   next: 'strategy' }],
+  strategy: [{ name: 'stratSouth',  door: DOORS.stratSouth,  next: 'corridor' },
+             { name: 'glassDoor',   door: DOORS.glassDoor,   next: 'lab'      }],
+  corridor: [{ name: 'labSouth',    door: DOORS.labSouth,    next: 'lab'      },
+             { name: 'stratSouth',  door: DOORS.stratSouth,  next: 'strategy' },
+             { name: 'studioNorth', door: DOORS.studioNorth, next: 'studio'   }],
+  studio:   [{ name: 'studioNorth', door: DOORS.studioNorth, next: 'corridor' },
+             { name: 'solidDoor',   door: DOORS.solidDoor,   next: 'utility'  }],
+  utility:  [{ name: 'solidDoor',   door: DOORS.solidDoor,   next: 'studio'   }],
 }
 
 function getZone(x: number, y: number): string {
@@ -81,7 +96,9 @@ function getZone(x: number, y: number): string {
   return 'corridor'
 }
 
-/** BFS through zone graph — returns ordered waypoints including final destination */
+/** BFS through zone graph — returns ordered waypoints including final destination.
+ *  Inserts an axis-alignment waypoint before each door so agents walk
+ *  perpendicular to partitions instead of cutting diagonally through them. */
 function planPath(
   fx: number, fy: number,
   tx: number, ty: number
@@ -90,21 +107,44 @@ function planPath(
   const toZone   = getZone(tx, ty)
   if (fromZone === toZone) return [{ x: tx, y: ty }]
 
-  type State = { zone: string; wps: Array<{x:number;y:number}> }
-  const queue: State[] = [{ zone: fromZone, wps: [] }]
+  type DoorWP = { name: string; x: number; y: number }
+  type State  = { zone: string; doors: DoorWP[] }
+  const queue: State[] = [{ zone: fromZone, doors: [] }]
   const visited = new Set([fromZone])
+  let doorSequence: DoorWP[] | null = null
 
-  while (queue.length > 0) {
-    const { zone, wps } = queue.shift()!
+  while (queue.length > 0 && !doorSequence) {
+    const { zone, doors } = queue.shift()!
     for (const edge of (ZONE_GRAPH[zone] ?? [])) {
       if (visited.has(edge.next)) continue
-      const next = [...wps, edge.door]
-      if (edge.next === toZone) return [...next, { x: tx, y: ty }]
+      const nextDoors = [...doors, { name: edge.name, x: edge.door.x, y: edge.door.y }]
+      if (edge.next === toZone) { doorSequence = nextDoors; break }
       visited.add(edge.next)
-      queue.push({ zone: edge.next, wps: next })
+      queue.push({ zone: edge.next, doors: nextDoors })
     }
   }
-  return [{ x: tx, y: ty }]  // fallback: direct
+
+  if (!doorSequence) return [{ x: tx, y: ty }]
+
+  // Build path: insert alignment waypoint before each door crossing
+  const result: Array<{ x: number; y: number }> = []
+  let prevX = fx, prevY = fy
+
+  for (const door of doorSequence) {
+    const axis = DOOR_CROSS_AXIS[door.name] ?? 'x'
+    if (axis === 'x') {
+      // Horizontal partition: move to door's X first, keeping current Y
+      if (Math.abs(door.x - prevX) > 8) result.push({ x: door.x, y: prevY })
+    } else {
+      // Vertical partition: move to door's Y first, keeping current X
+      if (Math.abs(door.y - prevY) > 8) result.push({ x: prevX, y: door.y })
+    }
+    result.push({ x: door.x, y: door.y })
+    prevX = door.x; prevY = door.y
+  }
+
+  result.push({ x: tx, y: ty })
+  return result
 }
 
 // ─── Room colors ──────────────────────────────────────────────────────────────
@@ -1272,6 +1312,21 @@ function makeAgentLabel(id: string, cx: number, isNorth: boolean): PIXI.Containe
 
   return c
 }
+
+// ─── Named activity spots ─────────────────────────────────────────────────────
+const BOOKSHELF_SPOTS = [
+  { x: 44,  y: 144 },  // Research Lab bookshelf (against north wall)
+  { x: 864, y: 144 },  // Strategy Office bookshelf
+]
+
+const PLANT_SPOTS = [
+  { x: 418, y: 210 },  // Lab plant (near glass partition)
+  { x: 248, y: 318 },  // Corridor left plant
+  { x: 636, y: 318 },  // Corridor right plant
+  { x: 570, y: 492 },  // Creative Studio plant
+]
+
+const COFFEE_SPOT = { x: 714, y: 482 }  // Coffee machine in utility zone
 
 // ─── Idle activity spots (mapped to new zone layout) ─────────────────────────
 const IDLE_SPOTS = [
